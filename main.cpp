@@ -75,7 +75,7 @@ void PrintSafetyHeader() {
     std::cout << " The conversion writes only partition-table metadata sectors;\n";
     std::cout << " it does not move or format partition contents. It cannot guarantee\n";
     std::cout << " bootability or recovery from power loss, hardware failure, or bugs.\n";
-    std::cout << " A verified full-disk backup is strongly recommended.\n\n";
+    std::cout << " Conversion mode requires a verified full-disk image before writing.\n\n";
     std::cout << " GPT GUIDs, names, attributes, and boot configuration do not all\n";
     std::cout << " have MBR equivalents. Unsupported layouts and partition types\n";
     std::cout << " are rejected. Successful conversion may still leave the disk\n";
@@ -94,15 +94,11 @@ struct GPTCopy {
 };
 
 #pragma pack(push, 1)
-struct GPTBackupFileHeader {
+struct DiskImageHeader {
     char magic[8];
     uint32_t version;
     uint32_t sectorSize;
-    uint64_t diskSectors;
-    uint64_t primaryEntriesLBA;
-    uint64_t backupEntriesLBA;
-    uint64_t entriesSectors;
-    uint64_t entriesBytes;
+    uint64_t diskBytes;
     uint32_t payloadCRC32;
 };
 #pragma pack(pop)
@@ -173,15 +169,18 @@ bool VerifyLBA(HANDLE hDisk, uint64_t lba, const uint8_t* expected, size_t byteC
     return true;
 }
 
-uint32_t CalculateCRC32(const uint8_t* data, size_t size) {
-    uint32_t crc = 0xFFFFFFFF;
+uint32_t UpdateCRC32(uint32_t crc, const uint8_t* data, size_t size) {
     for (size_t i = 0; i < size; ++i) {
         crc ^= data[i];
         for (int bit = 0; bit < 8; ++bit) {
             crc = (crc >> 1) ^ (0xEDB88320U & (0U - (crc & 1U)));
         }
     }
-    return ~crc;
+    return crc;
+}
+
+uint32_t CalculateCRC32(const uint8_t* data, size_t size) {
+    return ~UpdateCRC32(0xFFFFFFFF, data, size);
 }
 
 bool IsAllZero(const uint8_t* data, size_t size) {
@@ -276,65 +275,192 @@ bool MapPartitionType(const uint8_t typeGUID[16], uint8_t& mbrType) {
     return true;
 }
 
-void AppendBytes(std::vector<uint8_t>& destination, const void* data, size_t size) {
-    const uint8_t* bytes = static_cast<const uint8_t*>(data);
-    destination.insert(destination.end(), bytes, bytes + size);
-}
-
-bool CreateAndVerifyBackup(const std::string& path, const std::vector<uint8_t>& backup) {
-    HANDLE file = CreateFileA(path.c_str(), GENERIC_WRITE, 0, NULL, CREATE_NEW,
-                              FILE_ATTRIBUTE_NORMAL, NULL);
-    if (file == INVALID_HANDLE_VALUE) {
-        std::cerr << "[-] Error: Cannot create backup file '" << path
-                  << "'. Choose a new path on a different physical disk. Error: "
-                  << GetLastError() << "\n";
+bool GetExternalDestinationDirectory(const std::string& path, int sourceDiskNumber,
+                                    uint64_t requiredBytes, std::string& directory) {
+    char fullPath[MAX_PATH];
+    DWORD fullPathLength = GetFullPathNameA(path.c_str(), MAX_PATH, fullPath, NULL);
+    if (fullPathLength == 0 || fullPathLength >= MAX_PATH) {
+        std::cerr << "[-] Error: Could not resolve backup image path.\n";
         return false;
     }
 
-    bool writeSucceeded = true;
-    size_t writtenTotal = 0;
-    while (writtenTotal < backup.size()) {
-        DWORD chunk = static_cast<DWORD>(std::min<size_t>(backup.size() - writtenTotal, 1U << 20));
+    char* lastSlash = std::strrchr(fullPath, '\\');
+    char* lastForwardSlash = std::strrchr(fullPath, '/');
+    if (!lastSlash || (lastForwardSlash && lastForwardSlash > lastSlash)) {
+        lastSlash = lastForwardSlash;
+    }
+    if (!lastSlash) {
+        std::cerr << "[-] Error: Backup image path must include a directory.\n";
+        return false;
+    }
+    if (lastSlash == fullPath + 2 && fullPath[1] == ':') {
+        lastSlash[1] = '\0';
+    } else {
+        *lastSlash = '\0';
+    }
+    directory = fullPath;
+
+    char volumeRoot[MAX_PATH];
+    if (!GetVolumePathNameA(directory.c_str(), volumeRoot, MAX_PATH)) {
+        std::cerr << "[-] Error: Could not identify the image file's destination volume.\n";
+        return false;
+    }
+
+    const UINT driveType = GetDriveTypeA(volumeRoot);
+    if (driveType != DRIVE_REMOTE) {
+        char volumeName[MAX_PATH];
+        if (!GetVolumeNameForVolumeMountPointA(volumeRoot, volumeName, MAX_PATH)) {
+            std::cerr << "[-] Error: Could not identify the physical disk for the image volume.\n";
+            return false;
+        }
+        size_t volumeNameLength = std::strlen(volumeName);
+        if (volumeNameLength > 0 && volumeName[volumeNameLength - 1] == '\\') {
+            volumeName[volumeNameLength - 1] = '\0';
+        }
+        HANDLE volume = CreateFileA(volumeName, 0, FILE_SHARE_READ | FILE_SHARE_WRITE |
+                                   FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
+        if (volume == INVALID_HANDLE_VALUE) {
+            std::cerr << "[-] Error: Could not open the image volume to check its physical disk.\n";
+            return false;
+        }
+        std::vector<uint8_t> extentBuffer(sizeof(VOLUME_DISK_EXTENTS) +
+                                          15 * sizeof(DISK_EXTENT));
+        DWORD bytesReturned = 0;
+        bool identified = false;
+        for (;;) {
+            identified = DeviceIoControl(volume, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+                                         NULL, 0, extentBuffer.data(),
+                                         static_cast<DWORD>(extentBuffer.size()),
+                                         &bytesReturned, NULL);
+            if (identified || GetLastError() != ERROR_MORE_DATA ||
+                extentBuffer.size() >= (1U << 20)) {
+                break;
+            }
+            extentBuffer.resize(std::min<size_t>(extentBuffer.size() * 2, 1U << 20));
+        }
+        CloseHandle(volume);
+        if (!identified) {
+            std::cerr << "[-] Error: Could not determine every physical disk used by the image volume.\n";
+            return false;
+        }
+        const auto* extents = reinterpret_cast<const VOLUME_DISK_EXTENTS*>(extentBuffer.data());
+        const size_t requiredExtentBytes = offsetof(VOLUME_DISK_EXTENTS, Extents) +
+                                           static_cast<size_t>(extents->NumberOfDiskExtents) *
+                                               sizeof(DISK_EXTENT);
+        if (extents->NumberOfDiskExtents == 0 || bytesReturned < requiredExtentBytes) {
+            std::cerr << "[-] Error: Image destination volume returned invalid disk extents.\n";
+            return false;
+        }
+        for (DWORD i = 0; i < extents->NumberOfDiskExtents; ++i) {
+            if (extents->Extents[i].DiskNumber == static_cast<DWORD>(sourceDiskNumber)) {
+                std::cerr << "[-] Error: Backup image volume includes the source physical disk.\n";
+                return false;
+            }
+        }
+    }
+
+    ULARGE_INTEGER availableBytes{};
+    if (!GetDiskFreeSpaceExA(directory.c_str(), &availableBytes, NULL, NULL) ||
+        availableBytes.QuadPart < requiredBytes) {
+        std::cerr << "[-] Error: Image destination does not have enough available space.\n";
+        return false;
+    }
+    return true;
+}
+
+bool WriteFileBytes(HANDLE file, const uint8_t* data, size_t size) {
+    size_t completed = 0;
+    while (completed < size) {
+        DWORD chunk = static_cast<DWORD>(std::min<size_t>(size - completed, 1U << 20));
         DWORD bytesWritten = 0;
-        if (!WriteFile(file, backup.data() + writtenTotal, chunk, &bytesWritten, NULL) ||
+        if (!WriteFile(file, data + completed, chunk, &bytesWritten, NULL) ||
             bytesWritten != chunk) {
-            writeSucceeded = false;
-            break;
+            return false;
         }
-        writtenTotal += bytesWritten;
+        completed += bytesWritten;
     }
-    if (writeSucceeded && !FlushFileBuffers(file)) {
-        writeSucceeded = false;
-    }
-    CloseHandle(file);
+    return true;
+}
 
-    if (writeSucceeded) {
-        file = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
-                           FILE_ATTRIBUTE_NORMAL, NULL);
-        if (file == INVALID_HANDLE_VALUE) {
-            writeSucceeded = false;
+bool CreateAndVerifyFullDiskImage(const std::string& path, HANDLE hDisk,
+                                  uint64_t diskBytes, int sourceDiskNumber) {
+    if (diskBytes > UINT64_MAX - sizeof(DiskImageHeader)) {
+        std::cerr << "[-] Error: Full-disk image size overflows the supported file size.\n";
+        return false;
+    }
+    std::string destinationDirectory;
+    if (!GetExternalDestinationDirectory(path, sourceDiskNumber,
+                                         diskBytes + sizeof(DiskImageHeader),
+                                         destinationDirectory)) {
+        return false;
+    }
+
+    HANDLE image = CreateFileA(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, NULL,
+                               CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (image == INVALID_HANDLE_VALUE) {
+        std::cerr << "[-] Error: Cannot create image file '" << path
+                  << "'. Choose a new path. Error: " << GetLastError() << "\n";
+        return false;
+    }
+
+    DiskImageHeader header{};
+    std::memcpy(header.magic, "GPTDISK1", 8);
+    header.version = 1;
+    header.sectorSize = SECTOR_SIZE;
+    header.diskBytes = diskBytes;
+    bool succeeded = WriteFileBytes(image, reinterpret_cast<const uint8_t*>(&header),
+                                    sizeof(header));
+    std::vector<uint8_t> buffer(1U << 20);
+    uint32_t crc = 0xFFFFFFFF;
+    for (uint64_t offset = 0; succeeded && offset < diskBytes;) {
+        size_t chunk = static_cast<size_t>(std::min<uint64_t>(buffer.size(), diskBytes - offset));
+        succeeded = ReadAt(hDisk, offset, buffer.data(), chunk) &&
+                    WriteFileBytes(image, buffer.data(), chunk);
+        if (succeeded) {
+            crc = UpdateCRC32(crc, buffer.data(), chunk);
+            offset += chunk;
+        }
+    }
+    header.payloadCRC32 = ~crc;
+    if (succeeded) {
+        succeeded = WriteAt(image, 0, reinterpret_cast<const uint8_t*>(&header), sizeof(header)) &&
+                    FlushFileBuffers(image);
+    }
+    CloseHandle(image);
+
+    if (succeeded) {
+        image = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                            FILE_ATTRIBUTE_NORMAL, NULL);
+        if (image == INVALID_HANDLE_VALUE) {
+            succeeded = false;
         } else {
-            std::vector<uint8_t> check(backup.size());
-            size_t readTotal = 0;
-            while (readTotal < check.size()) {
-                DWORD chunk = static_cast<DWORD>(std::min<size_t>(check.size() - readTotal, 1U << 20));
-                DWORD bytesRead = 0;
-                if (!ReadFile(file, check.data() + readTotal, chunk, &bytesRead, NULL) ||
-                    bytesRead != chunk) {
-                    writeSucceeded = false;
-                    break;
+            LARGE_INTEGER imageSize{};
+            DiskImageHeader savedHeader{};
+            succeeded = GetFileSizeEx(image, &imageSize) &&
+                        imageSize.QuadPart == static_cast<LONGLONG>(diskBytes + sizeof(header)) &&
+                        ReadAt(image, 0, reinterpret_cast<uint8_t*>(&savedHeader), sizeof(savedHeader)) &&
+                        std::memcmp(&savedHeader, &header, sizeof(header)) == 0;
+
+            uint32_t verifyCRC = 0xFFFFFFFF;
+            std::vector<uint8_t> imageBuffer(buffer.size());
+            for (uint64_t offset = 0; succeeded && offset < diskBytes;) {
+                size_t chunk = static_cast<size_t>(std::min<uint64_t>(buffer.size(), diskBytes - offset));
+                succeeded =
+                    ReadAt(hDisk, offset, buffer.data(), chunk) &&
+                    ReadAt(image, sizeof(header) + offset, imageBuffer.data(), chunk) &&
+                    std::memcmp(buffer.data(), imageBuffer.data(), chunk) == 0;
+                if (succeeded) {
+                    verifyCRC = UpdateCRC32(verifyCRC, imageBuffer.data(), chunk);
                 }
-                readTotal += bytesRead;
+                if (succeeded) offset += chunk;
             }
-            if (writeSucceeded && check != backup) {
-                writeSucceeded = false;
-            }
-            CloseHandle(file);
+            succeeded = succeeded && ~verifyCRC == header.payloadCRC32;
+            CloseHandle(image);
         }
     }
 
-    if (!writeSucceeded) {
-        std::cerr << "[-] Error: Backup could not be fully written and verified; disk was not modified.\n";
+    if (!succeeded) {
+        std::cerr << "[-] Error: Full-disk image could not be created and verified; disk was not modified.\n";
         DeleteFileA(path.c_str());
         return false;
     }
@@ -362,161 +488,92 @@ bool RestoreMetadata(HANDLE hDisk, uint64_t primaryHeaderLBA, uint64_t backupHea
     return restored;
 }
 
-bool RestoreFromBackupFile(const std::string& path, HANDLE hDisk, uint64_t diskSectors) {
-    HANDLE file = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
-                              FILE_ATTRIBUTE_NORMAL, NULL);
-    if (file == INVALID_HANDLE_VALUE) {
-        std::cerr << "[-] Error: Cannot open metadata backup '" << path
+bool RestoreFromBackupFile(const std::string& path, HANDLE hDisk, uint64_t diskBytes,
+                           int targetDiskNumber) {
+    std::string destinationDirectory;
+    if (!GetExternalDestinationDirectory(path, targetDiskNumber, 0, destinationDirectory)) {
+        return false;
+    }
+
+    HANDLE image = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                               FILE_ATTRIBUTE_NORMAL, NULL);
+    if (image == INVALID_HANDLE_VALUE) {
+        std::cerr << "[-] Error: Cannot open full-disk image '" << path
                   << "'. Error: " << GetLastError() << "\n";
         return false;
     }
 
-    LARGE_INTEGER fileSize{};
-    if (!GetFileSizeEx(file, &fileSize) ||
-        fileSize.QuadPart < static_cast<LONGLONG>(sizeof(GPTBackupFileHeader)) ||
-        fileSize.QuadPart > (1LL << 28)) {
-        std::cerr << "[-] Error: Metadata backup size is invalid or exceeds 256 MiB.\n";
-        CloseHandle(file);
-        return false;
-    }
-    std::vector<uint8_t> data(static_cast<size_t>(fileSize.QuadPart));
-    size_t readTotal = 0;
-    while (readTotal < data.size()) {
-        DWORD chunk = static_cast<DWORD>(std::min<size_t>(data.size() - readTotal, 1U << 20));
-        DWORD bytesRead = 0;
-        if (!ReadFile(file, data.data() + readTotal, chunk, &bytesRead, NULL) ||
-            bytesRead != chunk) {
-            std::cerr << "[-] Error: Failed to read metadata backup.\n";
-            CloseHandle(file);
-            return false;
-        }
-        readTotal += bytesRead;
-    }
-    CloseHandle(file);
-
-    GPTBackupFileHeader header{};
-    std::memcpy(&header, data.data(), sizeof(header));
-    if (std::memcmp(header.magic, "GPTMBR1", 7) != 0 || header.magic[7] != 0 ||
+    DiskImageHeader header{};
+    LARGE_INTEGER imageSize{};
+    if (!GetFileSizeEx(image, &imageSize) ||
+        !ReadAt(image, 0, reinterpret_cast<uint8_t*>(&header), sizeof(header)) ||
+        std::memcmp(header.magic, "GPTDISK1", 8) != 0 ||
         header.version != 1 || header.sectorSize != SECTOR_SIZE ||
-        header.diskSectors != diskSectors || header.entriesSectors == 0 ||
-        header.entriesSectors > (1ULL << 17) ||
-        header.entriesBytes == 0 ||
-        header.entriesBytes > header.entriesSectors * SECTOR_SIZE ||
-        header.entriesBytes <= (header.entriesSectors - 1) * SECTOR_SIZE) {
-        std::cerr << "[-] Error: Metadata backup header is invalid or belongs to a different-sized disk.\n";
+        header.diskBytes != diskBytes ||
+        imageSize.QuadPart != static_cast<LONGLONG>(sizeof(header) + diskBytes)) {
+        std::cerr << "[-] Error: Image format or size does not match the target disk.\n";
+        CloseHandle(image);
         return false;
     }
 
-    const uint64_t expectedSize = sizeof(header) + 3ULL * SECTOR_SIZE +
-                                  2ULL * header.entriesSectors * SECTOR_SIZE;
-    if (expectedSize != data.size() ||
-        CalculateCRC32(data.data() + sizeof(header), data.size() - sizeof(header)) !=
-            header.payloadCRC32) {
-        std::cerr << "[-] Error: Metadata backup is truncated or its payload checksum is invalid.\n";
-        return false;
-    }
-
-    size_t offset = sizeof(header);
-    const uint8_t* savedMBR = data.data() + offset;
-    offset += SECTOR_SIZE;
-    const uint8_t* primaryHeaderSector = data.data() + offset;
-    offset += SECTOR_SIZE;
-    const uint8_t* primaryEntries = data.data() + offset;
-    offset += static_cast<size_t>(header.entriesSectors * SECTOR_SIZE);
-    const uint8_t* backupEntries = data.data() + offset;
-    offset += static_cast<size_t>(header.entriesSectors * SECTOR_SIZE);
-    const uint8_t* backupHeaderSector = data.data() + offset;
-
-    GPTHeader primaryHeader{};
-    GPTHeader backupHeader{};
-    std::memcpy(&primaryHeader, primaryHeaderSector, sizeof(primaryHeader));
-    std::memcpy(&backupHeader, backupHeaderSector, sizeof(backupHeader));
-    auto validSavedHeader = [&](const uint8_t* sector, const GPTHeader& gpt,
-                                uint64_t expectedCurrent, uint64_t expectedBackup,
-                                uint64_t expectedEntriesLBA) {
-        if (std::memcmp(gpt.signature, "EFI PART", 8) != 0 ||
-            gpt.revision != 0x00010000 || gpt.headerSize < sizeof(GPTHeader) ||
-            gpt.headerSize > SECTOR_SIZE || gpt.currentLBA != expectedCurrent ||
-            gpt.backupLBA != expectedBackup || gpt.partitionEntryLBA != expectedEntriesLBA ||
-            gpt.reserved != 0 || gpt.firstUsableLBA < 2 ||
-            gpt.firstUsableLBA > gpt.lastUsableLBA || gpt.lastUsableLBA >= diskSectors ||
-            gpt.numPartitionEntries == 0 ||
-            gpt.sizeOfPartitionEntry < sizeof(GPTPartitionEntry) ||
-            gpt.sizeOfPartitionEntry > 4096 || gpt.sizeOfPartitionEntry % 8 != 0 ||
-            static_cast<uint64_t>(gpt.numPartitionEntries) * gpt.sizeOfPartitionEntry != header.entriesBytes) {
-            return false;
+    std::vector<uint8_t> buffer(1U << 20);
+    uint32_t crc = 0xFFFFFFFF;
+    bool valid = true;
+    for (uint64_t offset = 0; valid && offset < diskBytes;) {
+        size_t chunk = static_cast<size_t>(std::min<uint64_t>(buffer.size(), diskBytes - offset));
+        valid = ReadAt(image, sizeof(header) + offset, buffer.data(), chunk);
+        if (valid) {
+            crc = UpdateCRC32(crc, buffer.data(), chunk);
+            offset += chunk;
         }
-        std::vector<uint8_t> crcData(sector, sector + gpt.headerSize);
-        std::memset(crcData.data() + offsetof(GPTHeader, headerCRC32), 0, sizeof(gpt.headerCRC32));
-        return CalculateCRC32(crcData.data(), crcData.size()) == gpt.headerCRC32;
-    };
-
-    if (static_cast<uint16_t>(savedMBR[510] | (savedMBR[511] << 8)) != 0xAA55 ||
-        !validSavedHeader(primaryHeaderSector, primaryHeader, 1, diskSectors - 1,
-                          header.primaryEntriesLBA) ||
-        !validSavedHeader(backupHeaderSector, backupHeader, diskSectors - 1, 1,
-                          header.backupEntriesLBA) ||
-        primaryHeader.firstUsableLBA != backupHeader.firstUsableLBA ||
-        primaryHeader.lastUsableLBA != backupHeader.lastUsableLBA ||
-        primaryHeader.numPartitionEntries != backupHeader.numPartitionEntries ||
-        primaryHeader.sizeOfPartitionEntry != backupHeader.sizeOfPartitionEntry ||
-        std::memcmp(primaryHeader.diskGUID, backupHeader.diskGUID, sizeof(primaryHeader.diskGUID)) != 0 ||
-        primaryHeader.partitionEntryArrayCRC32 != backupHeader.partitionEntryArrayCRC32 ||
-        header.entriesSectors != (header.entriesBytes + SECTOR_SIZE - 1) / SECTOR_SIZE ||
-        CalculateCRC32(primaryEntries, static_cast<size_t>(header.entriesBytes)) !=
-            primaryHeader.partitionEntryArrayCRC32 ||
-        CalculateCRC32(backupEntries, static_cast<size_t>(header.entriesBytes)) !=
-            backupHeader.partitionEntryArrayCRC32 ||
-        std::memcmp(primaryEntries, backupEntries,
-                    static_cast<size_t>(header.entriesBytes)) != 0 ||
-        header.primaryEntriesLBA < 2 ||
-        header.primaryEntriesLBA >= diskSectors ||
-        header.entriesSectors > diskSectors - header.primaryEntriesLBA ||
-        header.primaryEntriesLBA + header.entriesSectors > primaryHeader.firstUsableLBA ||
-        header.backupEntriesLBA <= primaryHeader.lastUsableLBA ||
-        header.backupEntriesLBA >= diskSectors ||
-        header.entriesSectors > diskSectors - header.backupEntriesLBA ||
-        header.backupEntriesLBA + header.entriesSectors > diskSectors - 1 ||
-        RangesOverlap(header.primaryEntriesLBA, header.entriesSectors,
-                      header.backupEntriesLBA, header.entriesSectors)) {
-        std::cerr << "[-] Error: Metadata backup contents or GPT layout failed validation.\n";
+    }
+    if (!valid || ~crc != header.payloadCRC32) {
+        std::cerr << "[-] Error: Full-disk image is unreadable or its CRC does not match.\n";
+        CloseHandle(image);
         return false;
     }
 
-    std::vector<uint8_t> currentMBR(SECTOR_SIZE);
-    if (!ReadLBA(hDisk, 0, currentMBR.data(), currentMBR.size()) ||
-        std::memcmp(currentMBR.data(), savedMBR, 446) != 0) {
-        std::cerr << "[-] Error: Target disk's preserved MBR boot-code/disk-ID region does not match the backup.\n";
+    std::cout << "[!] This overwrites every byte on PhysicalDrive" << targetDiskNumber << ".\n"
+              << "    Image: " << path << "\n";
+    std::string confirmation;
+    std::cout << "Type 'RESTORE FULL DISK PhysicalDrive" << targetDiskNumber
+              << "' exactly to continue: ";
+    std::getline(std::cin, confirmation);
+    if (confirmation != "RESTORE FULL DISK PhysicalDrive" +
+                        std::to_string(targetDiskNumber)) {
+        std::cout << "[-] Aborted. No disk sectors were modified.\n";
+        CloseHandle(image);
         return false;
     }
 
-    bool restored =
-        WriteLBA(hDisk, header.primaryEntriesLBA, primaryEntries,
-                 static_cast<size_t>(header.entriesSectors * SECTOR_SIZE)) &&
-        WriteLBA(hDisk, header.backupEntriesLBA, backupEntries,
-                 static_cast<size_t>(header.entriesSectors * SECTOR_SIZE)) &&
-        WriteLBA(hDisk, diskSectors - 1, backupHeaderSector, SECTOR_SIZE) &&
-        WriteLBA(hDisk, 1, primaryHeaderSector, SECTOR_SIZE) &&
-        WriteLBA(hDisk, 0, savedMBR, SECTOR_SIZE) &&
-        FlushFileBuffers(hDisk);
-    if (!restored) {
-        std::cerr << "[-] Error: Restoring metadata failed. Do not write to the disk again.\n";
-        return false;
+    bool restored = true;
+    for (uint64_t offset = 0; restored && offset < diskBytes;) {
+        size_t chunk = static_cast<size_t>(std::min<uint64_t>(buffer.size(), diskBytes - offset));
+        restored = ReadAt(image, sizeof(header) + offset, buffer.data(), chunk) &&
+                   WriteAt(hDisk, offset, buffer.data(), chunk);
+        if (restored) offset += chunk;
     }
+    if (restored) restored = FlushFileBuffers(hDisk);
 
-    std::vector<uint8_t> verifyMBR(SECTOR_SIZE);
-    GPTCopy verifyPrimary;
-    GPTCopy verifyBackup;
-    std::string verifyError;
-    if (!ReadLBA(hDisk, 0, verifyMBR.data(), verifyMBR.size()) ||
-        std::memcmp(verifyMBR.data(), savedMBR, verifyMBR.size()) != 0 ||
-        !LoadGPTCopy(hDisk, diskSectors, 1, verifyPrimary, verifyError) ||
-        !LoadGPTCopy(hDisk, diskSectors, diskSectors - 1, verifyBackup, verifyError)) {
-        std::cerr << "[-] Error: Restored metadata did not pass read-back verification. "
-                  << verifyError << "\n";
+    std::vector<uint8_t> imageBuffer(buffer.size());
+    crc = 0xFFFFFFFF;
+    for (uint64_t offset = 0; restored && offset < diskBytes;) {
+        size_t chunk = static_cast<size_t>(std::min<uint64_t>(buffer.size(), diskBytes - offset));
+        restored = ReadAt(image, sizeof(header) + offset, imageBuffer.data(), chunk) &&
+                   ReadAt(hDisk, offset, buffer.data(), chunk) &&
+                   std::memcmp(buffer.data(), imageBuffer.data(), chunk) == 0;
+        if (restored) {
+            crc = UpdateCRC32(crc, buffer.data(), chunk);
+            offset += chunk;
+        }
+    }
+    CloseHandle(image);
+    if (!restored || ~crc != header.payloadCRC32) {
+        std::cerr << "[-] Error: Full-disk restore or read-back verification failed. "
+                  << "Keep the image and do not write to the disk again.\n";
         return false;
     }
-    std::cout << "[+] Original GPT metadata restored and GPT CRCs verified.\n";
+    std::cout << "[+] Full-disk image restored and read-back verified.\n";
     return true;
 }
 
@@ -524,8 +581,8 @@ int main(int argc, char* argv[]) {
     if (argc < 2) {
         std::cout << "Usage:\n"
                   << "  GptToMbr.exe <PhysicalDriveNumber>                 (read-only preflight)\n"
-                  << "  GptToMbr.exe <PhysicalDriveNumber> --apply --backup <external-file>\n"
-                  << "  GptToMbr.exe <PhysicalDriveNumber> --restore <metadata-backup-file>\n";
+                  << "  GptToMbr.exe <PhysicalDriveNumber> --apply --backup <full-disk-image-path>\n"
+                  << "  GptToMbr.exe <PhysicalDriveNumber> --restore <full-disk-image-path>\n";
         return 1;
     }
 
@@ -560,7 +617,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     if (apply && backupPath.empty()) {
-        std::cerr << "[-] Error: --apply requires --backup <external-file>.\n";
+        std::cerr << "[-] Error: --apply requires --backup <full-disk-image-path>.\n";
         return 1;
     }
     if (!apply && !backupPath.empty()) {
@@ -600,22 +657,14 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     const uint64_t diskSectors = static_cast<uint64_t>(lengthInfo.Length.QuadPart / SECTOR_SIZE);
+    const uint64_t diskBytes = static_cast<uint64_t>(lengthInfo.Length.QuadPart);
     if (diskSectors < 68 || diskSectors > static_cast<uint64_t>(MAX_MBR_LBA) + 1) {
         std::cerr << "[-] Error: Disk size is outside the supported MBR LBA range.\n";
         CloseHandle(hDisk);
         return 1;
     }
     if (!restorePath.empty()) {
-        std::cout << "[!] Restore will overwrite the disk's partition metadata with the saved GPT metadata.\n";
-        std::string confirmation;
-        std::cout << "Type 'RESTORE PhysicalDrive" << driveNumber << "' exactly to continue: ";
-        std::getline(std::cin, confirmation);
-        if (confirmation != "RESTORE PhysicalDrive" + std::to_string(driveNumber)) {
-            std::cout << "[-] Aborted. No disk sectors were modified.\n";
-            CloseHandle(hDisk);
-            return 0;
-        }
-        bool restored = RestoreFromBackupFile(restorePath, hDisk, diskSectors);
+        bool restored = RestoreFromBackupFile(restorePath, hDisk, diskBytes, driveNumber);
         CloseHandle(hDisk);
         return restored ? 0 : 1;
     }
@@ -795,8 +844,9 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    std::cout << "\nWARNING: Verify that '" << backupPath
-              << "' is stored on a different physical disk. The program's backup contains GPT/MBR metadata only.\n";
+    std::cout << "\nThe program will create a full-disk image at:\n  " << backupPath
+              << "\nThe destination must be on another physical disk and have at least "
+              << diskBytes << " bytes free.\n";
     std::string backupConfirmation;
     std::cout << "Type 'BACKUP ON ANOTHER DISK' exactly to confirm: ";
     std::getline(std::cin, backupConfirmation);
@@ -815,31 +865,12 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    GPTBackupFileHeader backupHeader{};
-    std::memcpy(backupHeader.magic, "GPTMBR1", 7);
-    backupHeader.version = 1;
-    backupHeader.sectorSize = SECTOR_SIZE;
-    backupHeader.diskSectors = diskSectors;
-    backupHeader.primaryEntriesLBA = primary.header.partitionEntryLBA;
-    backupHeader.backupEntriesLBA = backup.header.partitionEntryLBA;
-    backupHeader.entriesSectors = primary.entriesSectors;
-    backupHeader.entriesBytes = primary.entriesBytes;
-    std::vector<uint8_t> backupFile;
-    AppendBytes(backupFile, &backupHeader, sizeof(backupHeader));
-    AppendBytes(backupFile, originalMBR.data(), originalMBR.size());
-    AppendBytes(backupFile, primary.headerSector.data(), primary.headerSector.size());
-    AppendBytes(backupFile, primary.entries.data(), primary.entries.size());
-    AppendBytes(backupFile, backup.entries.data(), backup.entries.size());
-    AppendBytes(backupFile, backup.headerSector.data(), backup.headerSector.size());
-    backupHeader.payloadCRC32 = CalculateCRC32(backupFile.data() + sizeof(backupHeader),
-                                               backupFile.size() - sizeof(backupHeader));
-    std::memcpy(backupFile.data(), &backupHeader, sizeof(backupHeader));
-    if (!CreateAndVerifyBackup(backupPath, backupFile)) {
+    if (!CreateAndVerifyFullDiskImage(backupPath, hDisk, diskBytes, driveNumber)) {
         CloseHandle(hDisk);
         return 1;
     }
-    std::cout << "[+] Metadata backup created and read-back verified: " << backupPath << "\n";
-    std::cout << "[!] Keep this backup; it contains the original partition-table metadata, not partition data.\n";
+    std::cout << "[+] Full-disk image created and verified: " << backupPath << "\n";
+    std::cout << "[+] The image contains every disk sector, including partition contents and metadata.\n";
 
     std::vector<uint8_t> zeroArray(primary.entries.size(), 0);
     std::vector<uint8_t> zeroSector(SECTOR_SIZE, 0);
@@ -872,7 +903,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "[-] Error: Conversion write or verification failed; attempting metadata rollback.\n";
         if (!RestoreMetadata(hDisk, 1, diskSectors - 1, primary, backup, originalMBR)) {
             std::cerr << "[-] CRITICAL: Automatic rollback failed. Do not write to the disk.\n"
-                      << "    Preserve the disk and metadata backup at '" << backupPath
+                      << "    Preserve the disk and full-disk image at '" << backupPath
                       << "' for recovery.\n";
         } else {
             std::cerr << "[+] Original GPT metadata and MBR were restored. Verify the disk and backup.\n";
@@ -883,7 +914,7 @@ int main(int argc, char* argv[]) {
 
     std::cout << "\n[+] MBR table written and read-back verified; GPT metadata removed.\n";
     std::cout << "[!] Partition contents were not written, but conversion is not a bootability or data-loss guarantee.\n";
-    std::cout << "[+] Original GPT metadata backup: " << backupPath << "\n";
+    std::cout << "[+] Full-disk image: " << backupPath << "\n";
     CloseHandle(hDisk);
     return 0;
 }

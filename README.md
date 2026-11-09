@@ -6,8 +6,9 @@ partition layouts to MBR on a selected physical drive.
 > **Warning:** This program writes directly to a physical disk. Its read-only
 > preflight checks GPT header and partition-array CRCs, validates both GPT
 > copies, and rejects unsupported layouts. Apply mode saves and verifies a
-> metadata backup, writes only sector 0 and GPT metadata sectors, then reads
-> those sectors back. Partition contents are not intentionally modified.
+> full-disk image on a different physical disk, writes only sector 0 and GPT
+> metadata sectors, then reads those sectors back. Partition contents are not
+> intentionally modified.
 > This is not a guarantee against software bugs, power loss, hardware failure,
 > data loss, or an unbootable disk. Make and verify a full-disk backup first;
 > test on a disk image or disposable disk.
@@ -21,10 +22,13 @@ partition layouts to MBR on a selected physical drive.
   attributes, unsupported partition types, more than four partitions, and
   layouts outside MBR's LBA limits. Supported type mappings are Windows basic
   data, EFI System, Windows recovery, Linux filesystem, and Linux swap.
-- Apply mode requires exclusive access and a new metadata-backup file path.
-  The backup contains sector 0, both GPT headers, and both partition arrays.
-  The program verifies the saved file before writing and attempts to restore
-  the original metadata if a write or read-back check fails.
+- Apply mode requires exclusive access and a new full-disk image path on a
+  different physical disk (or a remote volume). The image includes every
+  sector and a header with the disk size and CRC-32. The program checks that
+  the destination has enough space, writes the image, then rereads it and
+  compares it against the source disk before any conversion writes.
+- `--restore` validates the image size and CRC-32, restores every sector to
+  the target disk, and compares the restored disk against the image.
 - Preserves the first 446 bytes of sector 0, writes the new MBR table, and
   clears both GPT copies. It does not write partition-content sectors. GPT
   partition GUIDs, names, attributes, and boot configuration are not all
@@ -50,29 +54,33 @@ Replace `1` with the number of the target physical drive; `1` selects
 "C:\path\to\GptToMbr.exe" 1
 ```
 
-To convert, specify a new backup file on a different physical disk:
+To convert, specify a **new image path** on a different physical disk, with
+free space at least equal to the full source disk size:
 
 ```cmd
-"C:\path\to\GptToMbr.exe" 1 --apply --backup "E:\GptToMbr-PhysicalDrive1.gptbackup"
+"C:\path\to\GptToMbr.exe" 1 --apply --backup "E:\Backups\PhysicalDrive1.gptmbr"
 ```
 
-The program first requires typing `BACKUP ON ANOTHER DISK`, then
-`CONVERT PhysicalDrive1`. The metadata backup is not a backup of partition
-contents and is not a substitute for a verified full-disk backup. A sudden
-power loss can interrupt writes before automatic rollback is possible.
-Converting the partition table also does not convert an installed operating
-system's boot mode or guarantee that it will boot.
+The image path must not already exist. The program rejects a destination on
+the source physical disk, creates the complete image, checks its CRC-32, and
+rereads it for byte-for-byte comparison before it changes the partition table.
+It first requires typing `BACKUP ON ANOTHER DISK`, then
+`CONVERT PhysicalDrive1`. The image is a GPTtoMBR-specific format containing
+a small header followed by the exact disk bytes; it is not a plain raw image
+for third-party tools. For a consistent backup, take the source disk offline
+before running. A sudden power loss can interrupt conversion despite the
+backup. Conversion does not guarantee that the disk will boot.
 
-To restore the saved partition metadata after a failed or interrupted
-conversion, run:
+To restore the entire disk from the image, run:
 
 ```cmd
-"C:\path\to\GptToMbr.exe" 1 --restore "E:\GptToMbr-PhysicalDrive1.gptbackup"
+"C:\path\to\GptToMbr.exe" 1 --restore "E:\Backups\PhysicalDrive1.gptmbr"
 ```
 
-The restore path validates the backup format, checksum, disk size, GPT headers,
-and arrays before writing, then reads the restored GPT back for CRC checks.
-Keep the backup file until the disk has been independently inspected.
+Restore overwrites every byte on the target disk and requires typing
+`RESTORE FULL DISK PhysicalDrive1`. The image must be on a different physical
+disk and match the target's size exactly. Keep it until the restored disk has
+been independently inspected.
 
 ## Dependencies
 
