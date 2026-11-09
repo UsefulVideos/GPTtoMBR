@@ -92,9 +92,14 @@ Git, and (for Windows releases) MinGW-w64 and GitHub CLI packages.
 ## Build
 
 In VS Code, press **Ctrl+Shift+B** (or choose **Terminal > Run Build Task**) to
-build `GptToMbr.exe` using the default MinGW-w64 task. This uses the compiler
-and Windows libraries configured in the project makefile. Make and the
-MinGW-w64 cross-compiler must be installed and available on `PATH`.
+run the default MinGW-w64 build-and-release task. After a successful clean
+build, it commits tracked changes, pushes the current branch to `origin`, and
+publishes a GitHub release with the next patch version (starting at `v1.0.0`).
+The release includes the Windows executable and its SHA-256 checksum. The task
+requires Make, the MinGW-w64 cross-compiler, Git, and an authenticated GitHub
+CLI (`gh`) on `PATH`. It commits all tracked changes, so review them before
+building. It stops if there are staged changes or untracked files; commit or
+unstage staged changes and commit or ignore untracked files before starting.
 
 The regular CMake build compiles the program for the current host. On Linux
 this is the Windows-required stub; it is not a Linux disk-conversion utility.

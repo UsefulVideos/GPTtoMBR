@@ -2,10 +2,10 @@
     "tasks": [
         {
             "type": "process",
-            "label": "Build Windows executable (MinGW-w64)",
-            "command": "make",
+            "label": "Build, push, and release Windows executable",
+            "command": "bash",
             "args": [
-                "all"
+                "${workspaceFolder}/build-and-release.sh"
             ],
             "options": {
                 "cwd": "${workspaceFolder}"
@@ -17,7 +17,7 @@
                 "kind": "build",
                 "isDefault": true
             },
-            "detail": "Builds GptToMbr.exe with the MinGW-w64 compiler and Windows libraries configured in the project makefile."
+            "detail": "Clean-builds GptToMbr.exe, commits tracked changes, pushes the current branch, and publishes the next patch-version GitHub release."
         }
     ],
     "version": "2.0.0"
