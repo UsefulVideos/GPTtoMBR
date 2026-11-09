@@ -127,13 +127,19 @@ Git, and (for Windows releases) MinGW-w64 and GitHub CLI packages.
 
 In VS Code, press **Ctrl+Shift+B** (or choose **Terminal > Run Build Task**) to
 run the default MinGW-w64 build-and-release task. After a successful clean
-build, it commits tracked changes, pushes the current branch to `origin`, and
-publishes a GitHub release with the next patch version (starting at `v1.0.0`).
-The release includes the Windows executable and its SHA-256 checksum. The task
-requires Make, the MinGW-w64 cross-compiler, Git, and an authenticated GitHub
-CLI (`gh`) on `PATH`. It commits all tracked changes, so review them before
-building. It stops if there are staged changes or untracked files; commit or
-unstage staged changes and commit or ignore untracked files before starting.
+build, it commits tracked changes, pushes the current branch, and publishes a
+GitHub release with the next patch version (starting at `v1.0.0`). The task
+checks the authenticated `gh` account: `UsefulVideos` publishes to
+`UsefulVideos/GPTtoMBR`; any other account creates or reuses its
+`<account>/GPTtoMBR` fork and pushes/releases there. The fork is created with
+GitHub's fork relationship to this repository. Releases include the Windows
+executable and its SHA-256 checksum.
+
+The task requires Make, the MinGW-w64 cross-compiler, Git, and an authenticated
+GitHub CLI (`gh`) on `PATH`. It commits all tracked changes, so review them
+before building. It stops if there are staged changes or untracked files;
+commit or unstage staged changes and commit or ignore untracked files before
+starting.
 
 The regular CMake build compiles the program for the current host. On Linux
 this is the Windows-required stub; it is not a Linux disk-conversion utility.
@@ -161,16 +167,24 @@ The executable is written to `build/windows/GptToMbr.exe`.
 ## Create a GitHub release
 
 After committing and pushing a clean branch, create a versioned Windows release
-with the included script:
+with the included script. Without an explicit target, it detects the
+authenticated GitHub account and publishes to `UsefulVideos/GPTtoMBR` for
+`UsefulVideos`, or creates/uses that account's fork and publishes there:
 
 ```sh
 ./release.sh v1.0.0
 ```
 
+To select a target explicitly, pass its repository and configured Git remote:
+
+```sh
+./release.sh v1.0.0 your-account/GPTtoMBR user-fork
+```
+
 The script cross-compiles the Windows executable, creates a SHA-256 checksum,
-and publishes both as assets on the `UsefulVideos/GPTtoMBR` GitHub release.
-It requires the `gh` CLI to be authenticated, and verifies that the current
-branch's `HEAD` matches its `origin` branch before building.
+and publishes both as assets on the selected GitHub release. It requires the
+`gh` CLI to be authenticated, and verifies that the current branch's `HEAD`
+matches the selected remote branch before building.
 
 The same action is available as a CMake target on Unix-like systems:
 

@@ -14,7 +14,8 @@
 
 #pragma pack(push, 1)
 
-// MBR Partition Record (16 bytes)
+// MBR stores four 16-byte entries in sector 0. CHS values are retained for
+// compatibility; modern readers use the LBA fields below.
 struct MBRPartitionRecord {
     uint8_t  bootIndicator;
     uint8_t  startHead;
@@ -28,14 +29,16 @@ struct MBRPartitionRecord {
     uint32_t sectorCount;
 };
 
-// MBR Boot Sector (512 bytes)
+// The first 446 bytes are boot code/disk ID, followed by the partition table
+// and the 0xAA55 signature. Conversion deliberately preserves those 446 bytes.
 struct MBRBootSector {
     uint8_t               bootstrapCode[446];
     MBRPartitionRecord    partitions[4];
     uint16_t              bootSignature; // 0xAA55
 };
 
-// GPT Header Structure (subset of LBA 1)
+// GPT fields needed for validation and reading the partition array. The
+// on-disk header can be larger; headerSize controls its CRC coverage.
 struct GPTHeader {
     char     signature[8];       // "EFI PART"
     uint32_t revision;
@@ -53,7 +56,8 @@ struct GPTHeader {
     uint32_t partitionEntryArrayCRC32;
 };
 
-// GPT Partition Entry Structure (128 bytes)
+// The standard 128-byte prefix of a GPT entry. Larger entry sizes are accepted
+// when reading, but any bytes beyond this prefix are not converted to MBR.
 struct GPTPartitionEntry {
     uint8_t  typeGUID[16];
     uint8_t  uniqueGUID[16];
@@ -94,6 +98,8 @@ struct GPTCopy {
 };
 
 #pragma pack(push, 1)
+// Image files have this small header followed by exactly diskBytes of raw
+// sector data. The CRC covers the raw disk payload, not the header.
 struct DiskImageHeader {
     char magic[8];
     uint32_t version;
@@ -110,6 +116,7 @@ bool ReadAt(HANDLE hDisk, uint64_t offset, uint8_t* buffer, size_t byteCount) {
         return false;
     }
 
+    // Keep requests bounded so large disks work with DWORD-based Win32 I/O.
     size_t completed = 0;
     while (completed < byteCount) {
         DWORD chunk = static_cast<DWORD>(std::min<size_t>(byteCount - completed, 1U << 20));
@@ -148,6 +155,8 @@ bool ReadLBA(HANDLE hDisk, uint64_t lba, uint8_t* buffer, size_t byteCount) {
     return ReadAt(hDisk, lba * SECTOR_SIZE, buffer, byteCount);
 }
 
+// Convert sector addresses to byte offsets only after checking multiplication
+// cannot overflow. The program currently supports 512-byte logical sectors.
 bool WriteLBA(HANDLE hDisk, uint64_t lba, const uint8_t* buffer, size_t byteCount) {
     if (lba > UINT64_MAX / SECTOR_SIZE) {
         return false;
@@ -179,6 +188,8 @@ uint32_t UpdateCRC32(uint32_t crc, const uint8_t* data, size_t size) {
     return crc;
 }
 
+// Pass the returned CRC from one chunk to the next when checksumming a disk
+// image; CalculateCRC32 is the convenience wrapper for one contiguous buffer.
 uint32_t CalculateCRC32(const uint8_t* data, size_t size) {
     return ~UpdateCRC32(0xFFFFFFFF, data, size);
 }
@@ -220,6 +231,7 @@ bool LoadGPTCopy(HANDLE hDisk, uint64_t diskSectors, uint64_t headerLBA,
         return false;
     }
 
+    // Header CRC is calculated over headerSize bytes with its CRC field zeroed.
     std::vector<uint8_t> crcData(copy.headerSector.begin(),
                                  copy.headerSector.begin() + header.headerSize);
     std::memset(crcData.data() + offsetof(GPTHeader, headerCRC32), 0, sizeof(header.headerCRC32));
@@ -228,6 +240,8 @@ bool LoadGPTCopy(HANDLE hDisk, uint64_t diskSectors, uint64_t headerLBA,
         return false;
     }
 
+    // Keep logical entry bytes separate from sector-rounded bytes: GPT's array
+    // CRC excludes padding in the final sector, while I/O must include it.
     copy.entriesBytes = static_cast<uint64_t>(header.numPartitionEntries) *
                         header.sizeOfPartitionEntry;
     if (copy.entriesBytes > (1ULL << 26)) {
@@ -255,6 +269,9 @@ bool LoadGPTCopy(HANDLE hDisk, uint64_t diskSectors, uint64_t headerLBA,
 }
 
 bool MapPartitionType(const uint8_t typeGUID[16], uint8_t& mbrType) {
+    // Add mappings only when the GPT type has a safe, known MBR equivalent.
+    // Unknown types must fail closed instead of being assigned a generic type.
+    // GUID byte order here is the raw on-disk GPT representation.
     static const uint8_t basicData[16] =
         {0xA2, 0xA0, 0xD0, 0xEB, 0xE5, 0xB9, 0x33, 0x44, 0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7};
     static const uint8_t efiSystem[16] =
@@ -306,6 +323,8 @@ bool GetExternalDestinationDirectory(const std::string& path, int sourceDiskNumb
         return false;
     }
 
+    // A volume can span multiple disks. Reject it if any extent uses the source
+    // disk; remote volumes have no local disk number to compare.
     const UINT driveType = GetDriveTypeA(volumeRoot);
     if (driveType != DRIVE_REMOTE) {
         char volumeName[MAX_PATH];
@@ -408,6 +427,7 @@ bool CreateAndVerifyFullDiskImage(const std::string& path, HANDLE hDisk,
     header.version = 1;
     header.sectorSize = SECTOR_SIZE;
     header.diskBytes = diskBytes;
+    // Snapshot sequentially rather than buffering the whole disk in RAM.
     bool succeeded = WriteFileBytes(image, reinterpret_cast<const uint8_t*>(&header),
                                     sizeof(header));
     std::vector<uint8_t> buffer(1U << 20);
@@ -441,6 +461,8 @@ bool CreateAndVerifyFullDiskImage(const std::string& path, HANDLE hDisk,
                         ReadAt(image, 0, reinterpret_cast<uint8_t*>(&savedHeader), sizeof(savedHeader)) &&
                         std::memcmp(&savedHeader, &header, sizeof(header)) == 0;
 
+            // Read the source and image back in matching chunks. Byte comparison
+            // catches copy errors; the CRC is stored for future restore checks.
             uint32_t verifyCRC = 0xFFFFFFFF;
             std::vector<uint8_t> imageBuffer(buffer.size());
             for (uint64_t offset = 0; succeeded && offset < diskBytes;) {
@@ -470,6 +492,8 @@ bool CreateAndVerifyFullDiskImage(const std::string& path, HANDLE hDisk,
 bool RestoreMetadata(HANDLE hDisk, uint64_t primaryHeaderLBA, uint64_t backupHeaderLBA,
                      const GPTCopy& primary, const GPTCopy& backup,
                      const std::vector<uint8_t>& originalMBR) {
+    // Restore partition arrays and GPT headers before restoring sector 0 so a
+    // reader does not see a GPT signature pointing at incomplete metadata.
     bool restored =
         WriteLBA(hDisk, backup.header.partitionEntryLBA, backup.entries.data(), backup.entries.size()) &&
         WriteLBA(hDisk, primary.header.partitionEntryLBA, primary.entries.data(), primary.entries.size()) &&
@@ -517,6 +541,7 @@ bool RestoreFromBackupFile(const std::string& path, HANDLE hDisk, uint64_t diskB
     }
 
     std::vector<uint8_t> buffer(1U << 20);
+    // Validate the complete image before asking to overwrite the target.
     uint32_t crc = 0xFFFFFFFF;
     bool valid = true;
     for (uint64_t offset = 0; valid && offset < diskBytes;) {
@@ -546,6 +571,8 @@ bool RestoreFromBackupFile(const std::string& path, HANDLE hDisk, uint64_t diskB
         return false;
     }
 
+    // Restoration is deliberately sector-for-sector; this replaces the entire
+    // target, including any data not represented by partition entries.
     bool restored = true;
     for (uint64_t offset = 0; restored && offset < diskBytes;) {
         size_t chunk = static_cast<size_t>(std::min<uint64_t>(buffer.size(), diskBytes - offset));
@@ -593,6 +620,8 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     const int driveNumber = static_cast<int>(parsedDrive);
+    // No --apply means read-only preflight. Keep destructive modes explicit
+    // and require their own confirmation later in the flow.
     bool apply = false;
     std::string backupPath;
     std::string restorePath;
@@ -676,6 +705,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // Validate the primary and backup GPT independently before trusting either.
     GPTCopy primary;
     GPTCopy backup;
     std::string error;
@@ -745,6 +775,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // Build an MBR-ready list only after validating every used GPT entry.
     std::vector<GPTPartitionEntry> activePartitions;
     std::vector<uint8_t> mbrTypes;
     const uint8_t emptyGUID[16] = {};
@@ -802,6 +833,8 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // Check overlaps in disk order without changing the original GPT entry order
+    // used when writing the MBR table.
     std::vector<size_t> byStart(activePartitions.size());
     for (size_t i = 0; i < byStart.size(); ++i) byStart[i] = i;
     std::sort(byStart.begin(), byStart.end(), [&](size_t left, size_t right) {
@@ -815,6 +848,8 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // Preserve boot code/disk ID, replace only the four partition records, and
+    // keep the required MBR signature.
     MBRBootSector newMBR{};
     std::memcpy(&newMBR, originalMBR.data(), sizeof(newMBR));
     std::memset(newMBR.partitions, 0, sizeof(newMBR.partitions));
@@ -865,6 +900,8 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
+    // Do not touch the source disk until the external full-disk image is
+    // created and verified successfully.
     if (!CreateAndVerifyFullDiskImage(backupPath, hDisk, diskBytes, driveNumber)) {
         CloseHandle(hDisk);
         return 1;
@@ -874,6 +911,7 @@ int main(int argc, char* argv[]) {
 
     std::vector<uint8_t> zeroArray(primary.entries.size(), 0);
     std::vector<uint8_t> zeroSector(SECTOR_SIZE, 0);
+    // Clear both GPT copies so the disk does not advertise GPT and MBR at once.
     bool writeSucceeded =
         WriteLBA(hDisk, 0, reinterpret_cast<const uint8_t*>(&newMBR), sizeof(newMBR)) &&
         WriteLBA(hDisk, backup.header.partitionEntryLBA, zeroArray.data(), zeroArray.size()) &&
