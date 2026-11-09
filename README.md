@@ -1,28 +1,34 @@
 # GPTtoMBR
 
-GPTtoMBR is a small C++17 Windows console program that reads GPT partition
-entries from a selected physical drive and writes a new MBR partition table to
-that drive's first sector.
+GPTtoMBR is a small C++17 Windows console program that converts supported GPT
+partition layouts to MBR on a selected physical drive.
 
-> **Warning:** This program writes directly to a physical disk. The current
-> implementation replaces the protective MBR in LBA 0, does not update or
-> remove the GPT metadata, and does not preserve the old MBR boot code. It
-> should be treated as experimental and can make a disk unbootable or
-> inaccessible. Back up the disk and test only on disposable media or a disk
-> image. The program's "lossless" banner is not a guarantee of safe conversion.
+> **Warning:** This program writes directly to a physical disk. Its read-only
+> preflight checks GPT header and partition-array CRCs, validates both GPT
+> copies, and rejects unsupported layouts. Apply mode saves and verifies a
+> metadata backup, writes only sector 0 and GPT metadata sectors, then reads
+> those sectors back. Partition contents are not intentionally modified.
+> This is not a guarantee against software bugs, power loss, hardware failure,
+> data loss, or an unbootable disk. Make and verify a full-disk backup first;
+> test on a disk image or disposable disk.
 
 ## What the current code does
 
-- Accepts a physical drive number on Windows (for example, `1` for
-  `\\.\PhysicalDrive1`) and requests an explicit `YES` confirmation.
-- Reads the GPT header at LBA 1 and its partition-entry array, then refuses
-  disks with more than four used GPT entries or entries that exceed the
-  32-bit MBR LBA limit.
-- Writes one MBR sector at LBA 0. Every created partition is marked inactive
-  and assigned MBR type `0x07`; the GPT entry's type, boot flag, and other
-  metadata are not translated.
-- Assumes 512-byte sectors and does not check GPT CRCs, backup GPT metadata,
-  overlapping partitions, or all malformed GPT ranges.
+- Defaults to a read-only preflight. It checks 512-byte sectors, disk size,
+  both GPT headers and CRCs, both partition-array CRCs, and matching primary
+  and backup GPT copies.
+- Rejects overlapping partitions, non-protective MBR entries, nonzero GPT
+  attributes, unsupported partition types, more than four partitions, and
+  layouts outside MBR's LBA limits. Supported type mappings are Windows basic
+  data, EFI System, Windows recovery, Linux filesystem, and Linux swap.
+- Apply mode requires exclusive access and a new metadata-backup file path.
+  The backup contains sector 0, both GPT headers, and both partition arrays.
+  The program verifies the saved file before writing and attempts to restore
+  the original metadata if a write or read-back check fails.
+- Preserves the first 446 bytes of sector 0, writes the new MBR table, and
+  clears both GPT copies. It does not write partition-content sectors. GPT
+  partition GUIDs, names, attributes, and boot configuration are not all
+  representable in MBR and are not preserved.
 - Requires Windows and administrator privileges for physical-drive access.
   Wine is explicitly refused; running the program on Linux builds only a stub
   that reports that Windows is required.
@@ -38,15 +44,35 @@ GptToMbr.exe 1
 ```
 
 Replace `1` with the number of the target physical drive; `1` selects
-`\\.\PhysicalDrive1`. The executable path can also be supplied directly:
+`\\.\PhysicalDrive1`. First run the read-only preflight:
 
 ```cmd
 "C:\path\to\GptToMbr.exe" 1
 ```
 
-Check the drive number carefully before proceeding. When prompted, type
-`YES` in all caps and press Enter to confirm the disk write. Any other input
-aborts without writing. Review the warning above and back up the disk first.
+To convert, specify a new backup file on a different physical disk:
+
+```cmd
+"C:\path\to\GptToMbr.exe" 1 --apply --backup "E:\GptToMbr-PhysicalDrive1.gptbackup"
+```
+
+The program first requires typing `BACKUP ON ANOTHER DISK`, then
+`CONVERT PhysicalDrive1`. The metadata backup is not a backup of partition
+contents and is not a substitute for a verified full-disk backup. A sudden
+power loss can interrupt writes before automatic rollback is possible.
+Converting the partition table also does not convert an installed operating
+system's boot mode or guarantee that it will boot.
+
+To restore the saved partition metadata after a failed or interrupted
+conversion, run:
+
+```cmd
+"C:\path\to\GptToMbr.exe" 1 --restore "E:\GptToMbr-PhysicalDrive1.gptbackup"
+```
+
+The restore path validates the backup format, checksum, disk size, GPT headers,
+and arrays before writing, then reads the restored GPT back for CRC checks.
+Keep the backup file until the disk has been independently inspected.
 
 ## Dependencies
 
