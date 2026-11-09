@@ -24,8 +24,29 @@ that drive's first sector.
 - Assumes 512-byte sectors and does not check GPT CRCs, backup GPT metadata,
   overlapping partitions, or all malformed GPT ranges.
 - Requires Windows and administrator privileges for physical-drive access.
-  Running the program on Linux builds only a stub that reports that Windows is
-  required.
+  Wine is explicitly refused; running the program on Linux builds only a stub
+  that reports that Windows is required.
+
+## Run from Windows Command Prompt
+
+Open **Command Prompt as Administrator**, then change to the directory
+containing the executable. For example:
+
+```cmd
+cd /d "C:\path\to\GptToMbr"
+GptToMbr.exe 1
+```
+
+Replace `1` with the number of the target physical drive; `1` selects
+`\\.\PhysicalDrive1`. The executable path can also be supplied directly:
+
+```cmd
+"C:\path\to\GptToMbr.exe" 1
+```
+
+Check the drive number carefully before proceeding. When prompted, type
+`YES` in all caps and press Enter to confirm the disk write. Any other input
+aborts without writing. Review the warning above and back up the disk first.
 
 ## Dependencies
 
