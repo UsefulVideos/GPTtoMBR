@@ -91,6 +91,11 @@ Git, and (for Windows releases) MinGW-w64 and GitHub CLI packages.
 
 ## Build
 
+In VS Code, press **Ctrl+Shift+B** (or choose **Terminal > Run Build Task**) to
+build `GptToMbr.exe` using the default MinGW-w64 task. This uses the compiler
+and Windows libraries configured in the project makefile. Make and the
+MinGW-w64 cross-compiler must be installed and available on `PATH`.
+
 The regular CMake build compiles the program for the current host. On Linux
 this is the Windows-required stub; it is not a Linux disk-conversion utility.
 
