@@ -8,10 +8,14 @@
 #include <string>
 
 #ifdef _WIN32
+// These Windows headers provide the raw-disk I/O and disk-information APIs
+// used below. The converter cannot access physical disks on other platforms.
 #include <windows.h>
 #include <winioctl.h>
 #endif
 
+// GPT and MBR structures are written directly to disk. Disable the compiler's
+// normal padding between fields so each field lands at its specified byte.
 #pragma pack(push, 1)
 
 // MBR stores four 16-byte entries in sector 0. CHS values are retained for
@@ -69,7 +73,9 @@ struct GPTPartitionEntry {
 
 #pragma pack(pop)
 
+// MBR stores sector numbers in 32 bits, so it cannot address sectors past this.
 const uint32_t MAX_MBR_LBA = 0xFFFFFFFF; // 32-bit sector limit (~2.19 TB)
+// This implementation intentionally supports only disks with 512-byte sectors.
 const uint32_t SECTOR_SIZE = 512;
 
 void PrintSafetyHeader() {
@@ -89,6 +95,8 @@ void PrintSafetyHeader() {
 
 #ifdef _WIN32
 
+// A GPT has a header and an array of partition entries. This object keeps
+// both pieces together after they have been read and validated.
 struct GPTCopy {
     GPTHeader header{};
     std::vector<uint8_t> headerSector;
@@ -110,6 +118,8 @@ struct DiskImageHeader {
 #pragma pack(pop)
 
 bool ReadAt(HANDLE hDisk, uint64_t offset, uint8_t* buffer, size_t byteCount) {
+    // Windows uses a file-like handle even for a physical disk. Move its
+    // current position to the requested byte offset before reading.
     LARGE_INTEGER li;
     li.QuadPart = static_cast<LONGLONG>(offset);
     if (!SetFilePointerEx(hDisk, li, NULL, FILE_BEGIN)) {
@@ -121,6 +131,8 @@ bool ReadAt(HANDLE hDisk, uint64_t offset, uint8_t* buffer, size_t byteCount) {
     while (completed < byteCount) {
         DWORD chunk = static_cast<DWORD>(std::min<size_t>(byteCount - completed, 1U << 20));
         DWORD bytesRead = 0;
+        // A successful call can still transfer fewer bytes than requested;
+        // treat that as a failed read instead of using incomplete disk data.
         if (!ReadFile(hDisk, buffer + completed, chunk, &bytesRead, NULL) || bytesRead != chunk) {
             return false;
         }
@@ -140,6 +152,7 @@ bool WriteAt(HANDLE hDisk, uint64_t offset, const uint8_t* buffer, size_t byteCo
     while (completed < byteCount) {
         DWORD chunk = static_cast<DWORD>(std::min<size_t>(byteCount - completed, 1U << 20));
         DWORD bytesWritten = 0;
+        // Like reads, writes must transfer the entire requested chunk.
         if (!WriteFile(hDisk, buffer + completed, chunk, &bytesWritten, NULL) || bytesWritten != chunk) {
             return false;
         }
@@ -149,6 +162,8 @@ bool WriteAt(HANDLE hDisk, uint64_t offset, const uint8_t* buffer, size_t byteCo
 }
 
 bool ReadLBA(HANDLE hDisk, uint64_t lba, uint8_t* buffer, size_t byteCount) {
+    // LBA (Logical Block Addressing) numbers sectors from the beginning of a
+    // disk, starting at sector zero. Convert sectors to bytes for Windows I/O.
     if (lba > UINT64_MAX / SECTOR_SIZE) {
         return false;
     }
@@ -165,6 +180,8 @@ bool WriteLBA(HANDLE hDisk, uint64_t lba, const uint8_t* buffer, size_t byteCoun
 }
 
 bool VerifyLBA(HANDLE hDisk, uint64_t lba, const uint8_t* expected, size_t byteCount) {
+    // Compare disk contents to the expected bytes in small pieces. This avoids
+    // needing a second buffer as large as a whole GPT partition-entry array.
     std::vector<uint8_t> check(std::min<size_t>(byteCount, 1U << 20));
     size_t completed = 0;
     while (completed < byteCount) {
@@ -179,6 +196,8 @@ bool VerifyLBA(HANDLE hDisk, uint64_t lba, const uint8_t* expected, size_t byteC
 }
 
 uint32_t UpdateCRC32(uint32_t crc, const uint8_t* data, size_t size) {
+    // CRC-32 is a checksum used here to detect accidental changes or damage.
+    // It is not encryption and does not prove that data is trustworthy.
     for (size_t i = 0; i < size; ++i) {
         crc ^= data[i];
         for (int bit = 0; bit < 8; ++bit) {
@@ -195,9 +214,12 @@ uint32_t CalculateCRC32(const uint8_t* data, size_t size) {
 }
 
 bool IsAllZero(const uint8_t* data, size_t size) {
+    // Used after clearing GPT sectors to confirm they really read back as zero.
     return std::all_of(data, data + size, [](uint8_t value) { return value == 0; });
 }
 
+// Ranges are expressed as a starting sector plus a number of sectors. Convert
+// each count to its inclusive last sector, then test whether the ranges touch.
 bool RangesOverlap(uint64_t firstStart, uint64_t firstCount,
                    uint64_t secondStart, uint64_t secondCount) {
     return firstStart <= secondStart + secondCount - 1 &&
@@ -206,6 +228,9 @@ bool RangesOverlap(uint64_t firstStart, uint64_t firstCount,
 
 bool LoadGPTCopy(HANDLE hDisk, uint64_t diskSectors, uint64_t headerLBA,
                  GPTCopy& copy, std::string& error) {
+    // This routine does not assume the GPT is valid: it reads one copy, checks
+    // its fields and checksums, and returns false with a reason if anything
+    // looks unsupported or inconsistent.
     copy.headerSector.resize(SECTOR_SIZE);
     if (!ReadLBA(hDisk, headerLBA, copy.headerSector.data(), copy.headerSector.size())) {
         error = "Failed to read GPT header at LBA " + std::to_string(headerLBA) + ".";
@@ -218,6 +243,8 @@ bool LoadGPTCopy(HANDLE hDisk, uint64_t diskSectors, uint64_t headerLBA,
     }
 
     std::memcpy(&copy.header, copy.headerSector.data(), sizeof(copy.header));
+    // A reference names the header already stored in copy; it does not make
+    // another disk read or copy of the structure.
     const GPTHeader& header = copy.header;
     if (header.revision != 0x00010000 || header.headerSize < sizeof(GPTHeader) ||
         header.headerSize > SECTOR_SIZE || header.reserved != 0 ||
@@ -283,6 +310,8 @@ bool MapPartitionType(const uint8_t typeGUID[16], uint8_t& mbrType) {
     static const uint8_t linuxSwap[16] =
         {0x6D, 0xFD, 0x57, 0x06, 0xAB, 0xA4, 0xC4, 0x43, 0x84, 0xE5, 0x09, 0x33, 0xC8, 0x4B, 0x4F, 0x4F};
 
+    // GPT uses 16-byte type GUIDs; MBR uses a one-byte numeric type. The output
+    // parameter mbrType receives the matching byte when a known mapping exists.
     if (std::memcmp(typeGUID, basicData, 16) == 0) mbrType = 0x07;
     else if (std::memcmp(typeGUID, efiSystem, 16) == 0) mbrType = 0xEF;
     else if (std::memcmp(typeGUID, windowsRecovery, 16) == 0) mbrType = 0x27;
@@ -294,6 +323,8 @@ bool MapPartitionType(const uint8_t typeGUID[16], uint8_t& mbrType) {
 
 bool GetExternalDestinationDirectory(const std::string& path, int sourceDiskNumber,
                                     uint64_t requiredBytes, std::string& directory) {
+    // Resolve the backup path before writing anything, so the program can
+    // check free space and make sure the image is not on the disk being changed.
     char fullPath[MAX_PATH];
     DWORD fullPathLength = GetFullPathNameA(path.c_str(), MAX_PATH, fullPath, NULL);
     if (fullPathLength == 0 || fullPathLength >= MAX_PATH) {
@@ -388,6 +419,8 @@ bool GetExternalDestinationDirectory(const std::string& path, int sourceDiskNumb
 }
 
 bool WriteFileBytes(HANDLE file, const uint8_t* data, size_t size) {
+    // Write ordinary image-file bytes in chunks; this is separate from writing
+    // sectors to the physical disk.
     size_t completed = 0;
     while (completed < size) {
         DWORD chunk = static_cast<DWORD>(std::min<size_t>(size - completed, 1U << 20));
@@ -403,6 +436,8 @@ bool WriteFileBytes(HANDLE file, const uint8_t* data, size_t size) {
 
 bool CreateAndVerifyFullDiskImage(const std::string& path, HANDLE hDisk,
                                   uint64_t diskBytes, int sourceDiskNumber) {
+    // Save the entire source disk to a new file, then compare the saved bytes
+    // with the source. A failed backup prevents conversion from proceeding.
     if (diskBytes > UINT64_MAX - sizeof(DiskImageHeader)) {
         std::cerr << "[-] Error: Full-disk image size overflows the supported file size.\n";
         return false;
@@ -422,6 +457,8 @@ bool CreateAndVerifyFullDiskImage(const std::string& path, HANDLE hDisk,
         return false;
     }
 
+    // The header tells the restore command which format, sector size, and
+    // payload length to expect. The image payload immediately follows it.
     DiskImageHeader header{};
     std::memcpy(header.magic, "GPTDISK1", 8);
     header.version = 1;
@@ -494,6 +531,7 @@ bool RestoreMetadata(HANDLE hDisk, uint64_t primaryHeaderLBA, uint64_t backupHea
                      const std::vector<uint8_t>& originalMBR) {
     // Restore partition arrays and GPT headers before restoring sector 0 so a
     // reader does not see a GPT signature pointing at incomplete metadata.
+    // Each write is checked, and then the same regions are read back below.
     bool restored =
         WriteLBA(hDisk, backup.header.partitionEntryLBA, backup.entries.data(), backup.entries.size()) &&
         WriteLBA(hDisk, primary.header.partitionEntryLBA, primary.entries.data(), primary.entries.size()) &&
@@ -514,6 +552,8 @@ bool RestoreMetadata(HANDLE hDisk, uint64_t primaryHeaderLBA, uint64_t backupHea
 
 bool RestoreFromBackupFile(const std::string& path, HANDLE hDisk, uint64_t diskBytes,
                            int targetDiskNumber) {
+    // Restore is intentionally a separate command from conversion. It first
+    // verifies the image and asks for an exact confirmation before any writes.
     std::string destinationDirectory;
     if (!GetExternalDestinationDirectory(path, targetDiskNumber, 0, destinationDirectory)) {
         return false;
@@ -605,6 +645,8 @@ bool RestoreFromBackupFile(const std::string& path, HANDLE hDisk, uint64_t diskB
 }
 
 int main(int argc, char* argv[]) {
+    // argc is the number of command-line words; argv contains those words.
+    // argv[0] is the program name, so the disk number is expected at argv[1].
     if (argc < 2) {
         std::cout << "Usage:\n"
                   << "  GptToMbr.exe <PhysicalDriveNumber>                 (read-only preflight)\n"
@@ -613,6 +655,8 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // strtol parses text into a number and leaves end pointing at the first
+    // character it could not parse. Requiring '\0' rejects inputs like "2abc".
     char* end = NULL;
     long parsedDrive = std::strtol(argv[1], &end, 10);
     if (end == argv[1] || *end != '\0' || parsedDrive < 0 || parsedDrive > 255) {
@@ -625,6 +669,8 @@ int main(int argc, char* argv[]) {
     bool apply = false;
     std::string backupPath;
     std::string restorePath;
+    // Read optional flags from left to right. When a flag takes a path, advance
+    // i again so the path is not mistaken for another flag.
     for (int i = 2; i < argc; ++i) {
         if (std::strcmp(argv[i], "--apply") == 0) {
             apply = true;
@@ -658,6 +704,8 @@ int main(int argc, char* argv[]) {
     std::cout << "[Target Selected]: PhysicalDrive" << driveNumber << "\n\n";
     PrintSafetyHeader();
 
+    // Windows exposes physical drives through special device paths. Write
+    // access and exclusive sharing are requested only for destructive modes.
     std::wstring devicePath = L"\\\\.\\PhysicalDrive" + std::to_wstring(driveNumber);
     const bool modifiesDisk = apply || !restorePath.empty();
     DWORD access = modifiesDisk ? (GENERIC_READ | GENERIC_WRITE) : GENERIC_READ;
@@ -671,6 +719,8 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // Ask Windows for the disk's sector size and total length instead of
+    // assuming that the selected drive is the expected size.
     DISK_GEOMETRY_EX geometry{};
     DWORD bytesReturned = 0;
     GET_LENGTH_INFORMATION lengthInfo{};
@@ -685,6 +735,8 @@ int main(int argc, char* argv[]) {
         CloseHandle(hDisk);
         return 1;
     }
+    // Keep both units: diskSectors is used for GPT addresses, while diskBytes
+    // is used for file sizes and byte-offset I/O.
     const uint64_t diskSectors = static_cast<uint64_t>(lengthInfo.Length.QuadPart / SECTOR_SIZE);
     const uint64_t diskBytes = static_cast<uint64_t>(lengthInfo.Length.QuadPart);
     if (diskSectors < 68 || diskSectors > static_cast<uint64_t>(MAX_MBR_LBA) + 1) {
@@ -692,6 +744,8 @@ int main(int argc, char* argv[]) {
         CloseHandle(hDisk);
         return 1;
     }
+    // A restore operation is complete on its own; do not continue into GPT
+    // conversion preflight after writing the selected image.
     if (!restorePath.empty()) {
         bool restored = RestoreFromBackupFile(restorePath, hDisk, diskBytes, driveNumber);
         CloseHandle(hDisk);
@@ -717,6 +771,8 @@ int main(int argc, char* argv[]) {
         CloseHandle(hDisk);
         return 1;
     }
+    // The primary GPT is near the start of the disk and its backup is near the
+    // end. Compare their shared metadata and entries so neither copy is stale.
     if (primary.header.firstUsableLBA != backup.header.firstUsableLBA ||
         primary.header.lastUsableLBA != backup.header.lastUsableLBA ||
         primary.header.numPartitionEntries != backup.header.numPartitionEntries ||
@@ -733,6 +789,9 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // The primary table belongs after the primary header and before usable
+    // partitions; the backup table belongs after partitions and before its
+    // header. Reject layouts that put metadata in unexpected disk regions.
     if (primary.header.partitionEntryLBA < 2 ||
         primary.header.partitionEntryLBA + primary.entriesSectors > primary.header.firstUsableLBA ||
         backup.header.partitionEntryLBA <= primary.header.lastUsableLBA ||
@@ -748,6 +807,8 @@ int main(int argc, char* argv[]) {
         CloseHandle(hDisk);
         return 1;
     }
+    // GPT disks normally have a protective MBR entry (type 0xEE) at slot zero.
+    // It prevents older MBR-only tools from treating the disk as unpartitioned.
     bool protectiveMBRFound = false;
     for (size_t i = 0; i < 4; ++i) {
         MBRPartitionRecord existingRecord{};
@@ -776,6 +837,8 @@ int main(int argc, char* argv[]) {
     }
 
     // Build an MBR-ready list only after validating every used GPT entry.
+    // Build the list that will become MBR entries. Empty GPT slots have a zero
+    // type GUID and are skipped; every used slot must pass all checks below.
     std::vector<GPTPartitionEntry> activePartitions;
     std::vector<uint8_t> mbrTypes;
     const uint8_t emptyGUID[16] = {};
@@ -818,6 +881,8 @@ int main(int argc, char* argv[]) {
             CloseHandle(hDisk);
             return 1;
         }
+        // GPT's ending LBA is inclusive, so count both the first and last
+        // sectors by adding one after subtracting their addresses.
         uint64_t sectorCount = entry.endingLBA - entry.startingLBA + 1;
         if (sectorCount > MAX_MBR_LBA) {
             std::cerr << "[-] Error: Partition sector count exceeds the MBR limit.\n";
@@ -835,6 +900,8 @@ int main(int argc, char* argv[]) {
 
     // Check overlaps in disk order without changing the original GPT entry order
     // used when writing the MBR table.
+    // Sorting indexes (rather than the entries themselves) lets this check
+    // find overlaps while preserving the original partition-table order.
     std::vector<size_t> byStart(activePartitions.size());
     for (size_t i = 0; i < byStart.size(); ++i) byStart[i] = i;
     std::sort(byStart.begin(), byStart.end(), [&](size_t left, size_t right) {
@@ -857,6 +924,8 @@ int main(int argc, char* argv[]) {
     for (size_t i = 0; i < activePartitions.size(); ++i) {
         MBRPartitionRecord& record = newMBR.partitions[i];
         const GPTPartitionEntry& entry = activePartitions[i];
+        // CHS fields are legacy geometry values; the real start and length for
+        // this program are recorded in the LBA fields below.
         record.bootIndicator = 0;
         record.startHead = 0xFE;
         record.startSector = 0xFF;
@@ -869,6 +938,8 @@ int main(int argc, char* argv[]) {
         record.sectorCount = static_cast<uint32_t>(entry.endingLBA - entry.startingLBA + 1);
     }
 
+    // Up to this point the program has only read disk data and built a proposed
+    // MBR in memory. The default path exits here without changing the disk.
     std::cout << "[+] Preflight passed: both GPT copies and CRCs match; "
               << activePartitions.size() << " non-overlapping supported partition(s) found.\n";
     std::cout << "[+] Partition data sectors will not be written. GPT metadata and sector 0 will change.\n";
@@ -882,6 +953,8 @@ int main(int argc, char* argv[]) {
     std::cout << "\nThe program will create a full-disk image at:\n  " << backupPath
               << "\nThe destination must be on another physical disk and have at least "
               << diskBytes << " bytes free.\n";
+    // Two exact phrases make the user separately acknowledge the backup
+    // destination and the selected physical disk before destructive work.
     std::string backupConfirmation;
     std::cout << "Type 'BACKUP ON ANOTHER DISK' exactly to confirm: ";
     std::getline(std::cin, backupConfirmation);
@@ -909,6 +982,8 @@ int main(int argc, char* argv[]) {
     std::cout << "[+] Full-disk image created and verified: " << backupPath << "\n";
     std::cout << "[+] The image contains every disk sector, including partition contents and metadata.\n";
 
+    // Prepare replacement bytes in memory first. The image is already verified;
+    // now the MBR can replace GPT and both GPT copies can be cleared.
     std::vector<uint8_t> zeroArray(primary.entries.size(), 0);
     std::vector<uint8_t> zeroSector(SECTOR_SIZE, 0);
     // Clear both GPT copies so the disk does not advertise GPT and MBR at once.
@@ -920,6 +995,8 @@ int main(int argc, char* argv[]) {
         WriteLBA(hDisk, primary.header.currentLBA, zeroSector.data(), zeroSector.size()) &&
         FlushFileBuffers(hDisk);
 
+    // A successful write call is not enough: read each modified region back
+    // and confirm that the disk contains the values the program intended.
     std::vector<uint8_t> verifyMBR(SECTOR_SIZE);
     std::vector<uint8_t> verifyArray(zeroArray.size());
     std::vector<uint8_t> verifyHeader(SECTOR_SIZE);
@@ -937,6 +1014,8 @@ int main(int argc, char* argv[]) {
             IsAllZero(verifyHeader.data(), verifyHeader.size());
     }
 
+    // If any write or read-back check fails, put the original GPT metadata and
+    // sector zero back from the in-memory copies, then verify that rollback.
     if (!writeSucceeded) {
         std::cerr << "[-] Error: Conversion write or verification failed; attempting metadata rollback.\n";
         if (!RestoreMetadata(hDisk, 1, diskSectors - 1, primary, backup, originalMBR)) {
